@@ -85,9 +85,132 @@ The technical fixes are half the job. The other half is the audit summary, a wri
 
 ## Actions — What Was Built and Why
 
-Coming soon, project is currently being built! 
+### Step 1 — Create Misconfiguration 1: Public S3 Bucket with Exposed Credentials
+
+The first audit target is an S3 bucket with Block Public Access disabled. In the scenario, this bucket was created for a temporary file share and never locked down. A developer uploaded a configuration file containing internal API keys that has been publicly accessible for seven months with no authentication required.
+
+I created the bucket with Block Public Access unchecked and acknowledged the warning that the bucket would be public. Disabling Block Public Access alone is not enough to expose objects — AWS also requires a bucket policy explicitly granting public read access as an additional confirmation step. I added the policy, which reflects exactly how real accidental public exposure happens in production accounts.
+
+<div align="center">
+<img src="screenshots/s3-bucket-public-access-disabled.png" width="800"/>
+</div>
+
+To simulate the credential exposure, I created a fake configuration file on my Mac and uploaded it to the bucket. I confirmed the file was created correctly by printing its contents in the terminal before uploading.
+
+<div align="center">
+<img src="screenshots/fake-credentials-file-created.png" width="700"/>
+</div>
+
+I then opened the S3 object URL in an incognito browser window with no AWS login, no credentials, and no authentication of any kind. The file loaded immediately.
+
+<div align="center">
+<img src="screenshots/s3-incognito-access.png" width="800"/>
+</div>
+
+This is Finding 1 demonstrated. A file containing API keys and database connection strings is readable by anyone who finds the URL. No attack tool required. Just a browser.
+
 ---
 
-## Let's Connect!
+### Step 2 — Create Misconfiguration 2: IAM User with AdministratorAccess
 
-Brianne Young | Cloud Engineer | [LinkedIn](https://www.linkedin.com/in/brianne-young0/) | [GitHub](https://github.com/brianne-y)
+The second audit target is an IAM user with AdministratorAccess attached directly at the user level rather than through a group. In the scenario, this user was created for a contractor whose engagement ended months ago. The credentials were never deactivated.
+
+I created audit-test-user and attached AdministratorAccess directly.
+
+<div align="center">
+<img src="screenshots/iam-admin-access-attached.png" width="800"/>
+</div>
+
+To demonstrate the blast radius I generated access keys for the user, configured a temporary CLI profile named audit-demo, and ran four commands proving exactly what those credentials can access.
+
+<div align="center">
+<img src="screenshots/iam-blast-radius-users.png" width="800"/>
+</div>
+
+<div align="center">
+<img src="screenshots/iam-blast-radius-policy.png" width="800"/>
+</div>
+
+The output confirmed full account access. The caller identity showed AdministratorAccess, every S3 bucket in the account was listed, every IAM user was visible, and the policy confirmed unrestricted access to all AWS actions and all resources. The access keys were deleted immediately after capturing this output.
+
+This is Finding 2 demonstrated. Anyone who finds these credentials has full administrative control of the AWS account.
+
+---
+
+### Step 3 — Create Misconfiguration 3: Security Group with SSH Open and EC2 Instance
+
+The third audit target is a security group with port 22 open to 0.0.0.0/0. In the scenario, this security group was created during a production debugging session and never cleaned up. An EC2 instance is actively running with it attached.
+
+I created the security group audit-open-ssh-sg with an inbound SSH rule allowing any IPv4 address.
+
+<div align="center">
+<img src="screenshots/security-group-ssh-open.png" width="800"/>
+</div>
+
+I then launched a t2.micro EC2 instance with this security group attached to generate real VPC flow log activity for GuardDuty to analyze. A security group sitting idle with no running instance generates no traffic. A running instance with a public IP actively receives connection attempts from internet scanners.
+
+<div align="center">
+<img src="screenshots/ec2-instance-running.png" width="800"/>
+</div>
+
+To accelerate GuardDuty detection I made several intentional failed SSH connection attempts from my Mac terminal using a nonexistent username. Each attempt returned Permission denied, which is logged in VPC flow data that GuardDuty analyzes for brute force patterns.
+
+<div align="center">
+<img src="screenshots/ssh-failed-attempts.png" width="700"/>
+</div>
+
+This is Finding 3 in place. Internet scanners and intentional failed attempts are now generating the activity GuardDuty needs to surface real threat findings.
+
+---
+
+### Step 4 — Enable CloudTrail
+
+CloudTrail must be running before any remediation begins. Every change made from this point forward needs to be logged with a timestamp and identity attached. This is the chain of custody for the audit.
+
+I created the trail project-4-audit-trail with multi-region logging enabled, log file validation turned on, and CloudWatch Logs integration configured. Log file validation creates a cryptographic hash chain proving the logs have not been altered since delivery.
+
+<div align="center">
+<img src="screenshots/cloudtrail-trail-active.png" width="800"/>
+</div>
+
+---
+
+### Step 5 — Enable AWS Config and Compliance Rules
+
+AWS Config is the automated compliance monitor for this project. I set up the recorder for all resources and added three managed rules that map directly to the three misconfigurations created in Steps 1 through 3: s3-bucket-public-read-prohibited, iam-user-no-policies-check, and restricted-ssh.
+
+<div align="center">
+<img src="screenshots/config-recorder-active.png" width="800"/>
+</div>
+
+Within minutes of the rules being saved Config completed its initial evaluation. All three rules returned Noncompliant immediately, confirmed automatically with no manual input required.
+
+<div align="center">
+<img src="screenshots/config-rules-noncompliant.png" width="800"/>
+</div>
+
+---
+
+### Step 6 — Enable Security Hub
+
+Security Hub was initially unavailable due to an account plan restriction. After upgrading to a standard AWS account the service became accessible. Security Hub was enabled with both the AWS Foundational Security Best Practices and CIS AWS Foundations Benchmark standards active. It will begin aggregating findings from Config and GuardDuty as those services collect data.
+
+<div align="center">
+<img src="screenshots/security-hub-enabled.png" width="800"/>
+</div>
+
+---
+
+### Step 7 — Enable GuardDuty
+
+GuardDuty was also unavailable under the original account plan and was enabled after the account upgrade. GuardDuty is now analyzing VPC flow logs from the EC2 instance launched in Step 3. It does not require manual VPC flow log configuration — it accesses the underlying flow data independently.
+
+<div align="center">
+<img src="screenshots/guardduty-enabled.png" width="800"/>
+</div>
+
+The 24-hour collection window begins here. GuardDuty will surface SSH brute force findings as internet scanners probe the open port and as the intentional failed attempts from Step 3 are processed. The before state will be fully documented once findings populate.
+
+Steps 8 through 13 will be documented once the 24-hour collection window closes and GuardDuty findings have populated. Check back soon.
+
+---
