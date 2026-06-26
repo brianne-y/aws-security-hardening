@@ -203,14 +203,217 @@ Security Hub was initially unavailable due to an account plan restriction. After
 
 ### Step 7 — Enable GuardDuty
 
-GuardDuty was also unavailable under the original account plan and was enabled after the account upgrade. GuardDuty is now analyzing VPC flow logs from the EC2 instance launched in Step 3. It does not require manual VPC flow log configuration — it accesses the underlying flow data independently.
+GuardDuty was also unavailable under the original account plan and was enabled after the account upgrade. GuardDuty is now analyzing VPC flow logs from the EC2 instance launched in Step 3. It does not require manual VPC flow log configuration as it accesses the underlying flow data independently.
 
 <div align="center">
 <img src="screenshots/guardduty-enabled.png" width="800"/>
 </div>
 
-The 24-hour collection window begins here. GuardDuty will surface SSH brute force findings as internet scanners probe the open port and as the intentional failed attempts from Step 3 are processed. The before state will be fully documented once findings populate.
+---
 
-Steps 8 through 13 will be documented once the 24-hour collection window closes and GuardDuty findings have populated. Check back soon.
+### Step 8 — Document the Before State
+
+Before remediating anything, the violation state needed to be captured as evidence. Config had already flagged all three rules as Noncompliant. Security Hub had populated findings from the initial scan.
+
+<div align="center">
+<img src="screenshots/security-hub-before-state.png" width="800"/>
+</div>
+
+GuardDuty was enabled and monitoring the EC2 instance, but real SSH brute force findings did not surface within the expected window despite multiple rounds of intentional failed connection attempts from both the Mac terminal and AWS CloudShell. VPC flow logs were explicitly enabled on the default VPC as a troubleshooting step to ensure GuardDuty had the data it needed.
+
+<div align="center">
+<img src="screenshots/vpc-flow-logs-enabled.png" width="800"/>
+</div>
+
+<div align="center">
+<img src="screenshots/cloudshell-ssh-loop.png" width="800"/>
+</div>
+
+After several days without real findings, GuardDuty sample findings were generated using the built-in AWS sample findings feature to demonstrate what the detection looks like. The UnauthorizedAccess:EC2/SSHBruteForce finding confirms the type of threat activity an EC2 instance with port 22 open to 0.0.0.0/0 attracts in a real environment.
+
+<div align="center">
+<img src="screenshots/guardduty-ssh-finding-list.png" width="800"/>
+</div>
+
+<div align="center">
+<img src="screenshots/guardduty-ssh-finding-detail.png" width="800"/>
+</div>
+
+The troubleshooting process itself is documented honestly. Monitoring tools do not always behave predictably on newly upgraded accounts and diagnosing why is part of real security operations work.
 
 ---
+
+### Step 9 — Remediate Each Misconfiguration
+
+With the before state fully documented, each finding was remediated one at a time.
+
+**Finding 1: S3 Public Access**
+
+Block all public access was re-enabled on the audit-target bucket. Config re-evaluated the s3-bucket-public-read-prohibited rule within minutes and returned Compliant.
+
+<div align="center">
+<img src="screenshots/s3-block-public-access-enabled.png" width="800"/>
+</div>
+
+**Finding 2: IAM Over-Permission**
+
+AdministratorAccess was removed from audit-test-user. Rather than attaching a new policy directly at the user level, which is itself a best practice violation, a group called audit-read-only-group was created with ReadOnlyAccess attached. The user was then added to the group. This corrects both the permission scope and the structural problem that direct policy attachment creates.
+
+<div align="center">
+<img src="screenshots/iam-remediated.png" width="800"/>
+</div>
+
+**Finding 3: Security Group SSH Open to World**
+
+The SSH inbound rule on audit-open-ssh-sg was updated from source 0.0.0.0/0 to the current public IP address using the My IP option in the console. During this review, a separate pre-existing misconfiguration was also discovered: the default VPC security group had an allow-all inbound rule from a previous project. That rule was removed as well.
+
+<div align="center">
+<img src="screenshots/security-group-remediated.png" width="800"/>
+</div>
+
+---
+
+### Step 10 — Configure Automatic Remediation for Future Violations
+
+Manual remediation fixes the immediate findings. Automatic remediation ensures that if the same misconfiguration reappears it gets corrected without waiting for human intervention.
+
+AWS Config automatic remediation was configured for the s3-bucket-public-read-prohibited rule using the AWS-DisableS3BucketPublicReadWrite managed action. A dedicated IAM role was created for Config to assume when executing the remediation. Rather than attaching AmazonS3FullAccess, a scoped inline policy was created with only the two actions required: s3:PutBucketPublicAccessBlock and s3:GetBucketPublicAccessBlock. Automatic remediation configured with an overpermissioned role defeats the least-privilege principle this project is built around.
+
+<div align="center">
+<img src="screenshots/config-remediation-role-policy.png" width="800"/>
+</div>
+
+<div align="center">
+<img src="screenshots/config-s3-remediation-configured.png" width="800"/>
+</div>
+
+Automatic remediation was not configured for the IAM and SSH rules. The available managed actions for those findings carry risk of unintended impact on resources outside the scope of this audit. Manual remediation is documented for those findings and the rationale for not automating them is noted in the audit summary.
+
+---
+
+### Step 11 — Verify All Rules Compliant
+
+After remediation, Config re-evaluated all three rules. The audit target resources for each rule returned Compliant.
+
+The IAM rule shows the remediated audit-test-user as Compliant alongside a noncompliant resource from a prior project. That resource is outside the scope of this audit.
+
+<div align="center">
+<img src="screenshots/config-iam-compliant.png" width="800"/>
+</div>
+
+<div align="center">
+<img src="screenshots/config-ssh-compliant.png" width="800"/>
+</div>
+
+For the S3 rule, the audit-target bucket was confirmed remediated through the Permissions tab showing Block all public access fully enabled, captured in Step 9.
+
+---
+
+### Step 12 — Set Up Continuous Alerting for Future Drift
+
+The environment is now compliant. The next requirement is making sure it stays that way without manual checking.
+
+An EventBridge rule was created to fire whenever AWS Config detects any resource moving to NON_COMPLIANT. The rule uses a custom event pattern targeting Config compliance change events and routes them to the config-compliance-alerts SNS topic.
+
+<div align="center">
+<img src="screenshots/eventbridge-rule.png" width="800"/>
+</div>
+
+An email subscription was added to the SNS topic and confirmed.
+
+<div align="center">
+<img src="screenshots/sns-subscription-confirmed.png" width="800"/>
+</div>
+
+---
+
+### Step 13 — CloudWatch Metric Filter and Alarm
+
+CloudTrail logs every API call but does not alert on its own. A metric filter was created on the CloudTrail log group to watch for unauthorized API call patterns: AccessDenied, UnauthorizedAccess, and AuthFailure errors. These patterns signal either compromised credentials being used to probe the account or permission boundaries being exceeded.
+
+The filter publishes to a custom metric namespace called CloudTrailMetrics. A CloudWatch alarm was configured on that metric with a threshold of Greater than 0 and a 5-minute evaluation period. The alarm routes to the config-compliance-alerts SNS topic.
+
+Within minutes of the alarm being created it fired. An API call during the project matched the filter pattern, CloudWatch detected it, and an email arrived from SNS confirming the detection pipeline worked end to end.
+
+<div align="center">
+<img src="screenshots/cloudwatch-alarm-triggered.png" width="800"/>
+</div>
+
+This is the most direct proof in the project that the monitoring stack is actively watching and responding to real activity in the account.
+
+---
+
+## Results — What the Working System Demonstrates
+
+All three Config rules returned Compliant after remediation. The S3 credentials file is no longer publicly accessible. The IAM user no longer has direct policy attachment and operates under ReadOnlyAccess through a properly structured group. The security group no longer allows SSH from the entire internet. A pre-existing allow-all rule in the default security group was identified and removed during the review.
+
+Automatic remediation is configured for the S3 rule using a least-privilege IAM role. EventBridge fires an SNS email the moment any resource drifts out of compliance. The CloudWatch metric filter detected a real unauthorized API call pattern and fired an alarm with an email notification during the build.
+
+The audit summary report is committed to this repository alongside the screenshots. The before state is documented with evidence of real exploitability. The after state is verified and documented. The monitoring layer is active.
+
+---
+
+## Troubleshooting — Real Issues Encountered and Resolved
+
+**Issue 1 — GuardDuty SSH brute force findings did not populate**
+After launching the EC2 instance with the open SSH security group and making intentional failed connection attempts, GuardDuty surfaced no findings over several days. Troubleshooting steps taken: ran 50 SSH attempts in a loop from AWS CloudShell to simulate external brute force activity from an unrelated IP, explicitly enabled VPC flow logs on the default VPC to ensure GuardDuty had the underlying data it needed, and waited an additional 24 hours. No findings appeared. GuardDuty sample findings were generated using the built-in AWS feature to demonstrate what the detection looks like. The likely cause is a newly upgraded account that had not fully propagated GuardDuty's VPC flow log access at the time of the build.
+
+**Issue 2 — IAM and SSH Config rules showed additional noncompliant resources from prior projects**
+After remediating the three audit targets, the iam-user-no-policies-check and restricted-ssh rules continued showing as noncompliant due to resources from previous portfolio projects. These resources were outside the scope of this audit. The specific audit target resources were confirmed Compliant at the individual resource level within each rule. A pre-existing allow-all inbound rule on the default security group was discovered and removed during the review.
+
+**Issue 3 — Config automatic remediation returned an assumeRole parameter error**
+The initial attempt to configure automatic remediation for the S3 rule failed because no IAM role was specified. A dedicated IAM role was created with a scoped inline policy containing only the two S3 actions required for the remediation. The role ARN was added to the AutomationAssumeRole parameter and the remediation configuration was saved successfully.
+
+---
+
+## Security Implementation Summary
+
+| Layer | Control | Purpose |
+|-------|---------|---------|
+| S3 | Block all public access enabled | Bucket objects are no longer accessible without authentication |
+| S3 | Automatic Config remediation configured | If public access is re-enabled, Config detects and reverts it automatically |
+| IAM | AdministratorAccess removed from user | Direct admin policy attachment eliminated |
+| IAM | User added to group with ReadOnlyAccess | Least privilege enforced through proper group structure |
+| EC2 | SSH restricted to specific IP | Port 22 no longer accessible from the entire internet |
+| VPC | Default security group allow-all rule removed | Pre-existing misconfiguration identified and remediated during audit review |
+| Config | Three managed rules active | s3-bucket-public-read-prohibited, iam-user-no-policies-check, restricted-ssh continuously evaluated |
+| EventBridge | NON_COMPLIANT trigger configured | Any future compliance drift fires an immediate SNS email |
+| CloudTrail | Multi-region trail with log file validation | Complete API audit trail with tamper-evident logging |
+| CloudWatch | Metric filter on unauthorized API patterns | AccessDenied and auth failure patterns trigger an alarm before manual detection |
+
+---
+
+## Key Learnings
+
+The most important thing this project reinforced is that security is not a state you reach, rather it is a posture you maintain. Remediating three misconfigurations without configuring continuous monitoring would just mean finding the same issues again in six months.
+
+Documentation is not optional. The audit summary, the before-state screenshots, and the impact demonstrations are what separate a security fix from a security audit. Anyone can change a setting. Proving the setting was wrong, showing the consequences, and documenting what was done is the actual deliverable.
+
+Scope management is a real skill. Not every Config violation in the account was in scope for this audit. Knowing what is in scope, documenting what is out of scope, and explaining why is something that comes up in every real engagement.
+
+The CloudWatch alarm firing on real activity during the build was the most meaningful confirmation that the monitoring stack was working. That outcome is more valuable than any planned test would have been.
+
+Monitoring tools do not always behave predictably. GuardDuty not surfacing SSH findings despite days of effort and multiple troubleshooting steps is a real-world outcome that happens in production environments. Diagnosing the issue methodically, documenting what was tried, and continuing to move forward is what the job actually looks like.
+
+---
+
+## Cleanup — Avoid Ongoing AWS Charges
+
+**Important:** GuardDuty and Security Hub are on 30-day free trials. Disable both before the trial ends to avoid charges.
+
+1. GuardDuty: Settings → Disable GuardDuty → confirm
+2. Security Hub: Settings → General → Disable AWS Security Hub → confirm
+3. AWS Config: Settings → turn off recording → empty and delete config-logs bucket
+4. CloudTrail: select trail → Stop logging → delete trail → empty and delete cloudtrail-logs bucket
+5. EventBridge: Rules → select config-compliance-change-alert → Delete
+6. CloudWatch: Log groups → select CloudTrail log group → Delete. Alarms → select unauthorized-api-calls-alarm → Delete
+7. SNS: Topics → select config-compliance-alerts → Delete
+8. S3: empty and delete audit-target bucket
+9. IAM: delete audit-test-user and audit-read-only-group
+10. EC2: confirm audit-target-ec2 is terminated. Delete audit-open-ssh-sg security group.
+
+---
+
+## Let's Connect!
+
+Brianne Young | Cloud Engineer | [LinkedIn](https://www.linkedin.com/in/brianne-young0/) | [GitHub](https://github.com/brianne-y)
